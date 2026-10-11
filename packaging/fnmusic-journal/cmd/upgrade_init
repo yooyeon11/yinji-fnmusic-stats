@@ -1,0 +1,6 @@
+#!/bin/bash
+
+### Called before the user upgrades the application.
+### The recording archive in TRIM_PKGVAR is kept across upgrades.
+
+exit 0

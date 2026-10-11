@@ -1,0 +1,6 @@
+#!/bin/bash
+
+### Called before the user changes environment variables in the app settings.
+### 音迹 reads JOURNAL_MUSIC_SERVER and JOURNAL_TZ; other settings live in the web UI.
+
+exit 0

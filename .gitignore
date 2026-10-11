@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Runtime data (tokens, listening records) — never commit
+runtime/
+
+# Packaging artifacts (rebuilt by packaging/build.py; release assets go to Releases)
+packaging/fnmusic-journal/app/
+packaging/tools/fnpack-*.exe
+*.fpk
+
+# Local dev
+.env

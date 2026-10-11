@@ -1,0 +1,9 @@
+#!/bin/bash
+
+### Called before uninstall cleanup.
+### Uninstalling removes TRIM_PKGVAR with the recording archive and the saved
+### music token; this script only reports that, it does not delete anything.
+
+echo "卸载将删除数据目录 ${TRIM_PKGVAR}（播放记录与已保存的飞牛音乐连接）。"
+
+exit 0

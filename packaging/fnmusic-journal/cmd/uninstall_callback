@@ -1,0 +1,5 @@
+#!/bin/bash
+
+### Called after uninstall cleanup.
+
+exit 0

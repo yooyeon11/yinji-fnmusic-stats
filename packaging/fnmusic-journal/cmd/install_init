@@ -1,0 +1,8 @@
+#!/bin/bash
+
+### Called before the user installs the application.
+### The recording archive is created on first start inside TRIM_PKGVAR.
+
+echo "音迹将安装到 ${TRIM_APPDEST}，数据目录为 ${TRIM_PKGVAR}。"
+
+exit 0
