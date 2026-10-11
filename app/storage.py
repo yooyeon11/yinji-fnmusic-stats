@@ -197,6 +197,118 @@ class Archive:
         results = Counter(self.insert_event(user, event, source) for event in events)
         return {"ok": True, **{key: results[key] for key in ("accepted", "deduped", "skipped")}}
 
+    def export_all(self, user):
+        """Complete per-account backup payload. Never includes sessions or tokens."""
+        with self.connection() as conn:
+            plays = [dict(row) for row in conn.execute(
+                "SELECT * FROM plays WHERE user_id=? ORDER BY played_at, id", (user,))]
+            tracks = [dict(row) for row in conn.execute(
+                "SELECT * FROM tracks WHERE user_id=? ORDER BY guid", (user,))]
+            artist_images = [dict(row) for row in conn.execute(
+                "SELECT * FROM artist_images WHERE user_id=? ORDER BY artist", (user,))]
+        for row in plays + tracks + artist_images:
+            row.pop("user_id", None)
+        return {"format": "yinji-backup", "version": 1,
+                "exported_at": int(time.time() * 1000),
+                "plays": plays, "tracks": tracks, "artist_images": artist_images}
+
+    @staticmethod
+    def _clean_backup_text(value, limit=300):
+        return value.strip()[:limit] if isinstance(value, str) and value.strip() else None
+
+    def _validate_play_row(self, row):
+        if not isinstance(row, dict):
+            return None
+        guid = row.get("guid")
+        stamp = row.get("played_at")
+        if not isinstance(guid, str) or not guid.strip() or len(guid) > 256 or isinstance(stamp, bool):
+            return None
+        try:
+            stamp = int(stamp)
+        except (TypeError, ValueError):
+            return None
+        if not 946684800000 <= stamp <= int(time.time() * 1000) + 300000:
+            return None
+        confidence = row.get("confidence")
+        confidence = confidence if confidence in ("exact", "observed") else "observed"
+        source = row.get("source")
+        source = source.strip()[:40] if isinstance(source, str) and source.strip() else "import"
+        duration = row.get("duration_ms")
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
+            duration = 0
+        return {"guid": guid.strip(), "played_at": stamp, "source": source, "confidence": confidence,
+                "title": self._clean_backup_text(row.get("title")), "artist": self._clean_backup_text(row.get("artist")),
+                "album": self._clean_backup_text(row.get("album")), "genre": self._clean_backup_text(row.get("genre"), 200),
+                "duration_ms": duration, "cover_id": self._clean_backup_text(row.get("cover_id"), 128) or ""}
+
+    def restore_all(self, user, data, mode="merge"):
+        """Import a backup payload. mode="restore" replaces this account's data,
+        mode="merge" keeps existing rows and dedupes by guid+played_at."""
+        if not isinstance(data, dict) or data.get("format") != "yinji-backup":
+            raise ValueError("不是有效的音迹备份文件")
+        if mode not in ("restore", "merge"):
+            raise ValueError("无效的导入模式")
+        plays, tracks, artists = data.get("plays"), data.get("tracks"), data.get("artist_images")
+        if not isinstance(plays, list) or not isinstance(tracks, list) or not isinstance(artists, list):
+            raise ValueError("备份文件数据不完整")
+        if len(plays) > 500000 or len(tracks) > 200000 or len(artists) > 200000:
+            raise ValueError("备份文件过大")
+        clean_plays, skipped = [], 0
+        seen_keys = set()
+        for row in plays:
+            clean = self._validate_play_row(row)
+            if clean is None:
+                skipped += 1
+                continue
+            key = f"play:{clean['guid']}:{clean['played_at']}"
+            if key in seen_keys:
+                skipped += 1
+                continue
+            seen_keys.add(key)
+            clean_plays.append((key, clean))
+        clean_tracks = [t for t in tracks if isinstance(t, dict)
+                        and isinstance(t.get("guid"), str) and t.get("guid").strip()
+                        and len(t["guid"]) <= 256]
+        clean_artists = [a for a in artists if isinstance(a, dict)
+                         and isinstance(a.get("artist"), str) and a.get("artist").strip()]
+
+        now = int(time.time() * 1000)
+        counts = {"plays": 0, "tracks": 0, "artists": 0, "skipped": skipped}
+        track_sql = ("""INSERT INTO tracks VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(user_id,guid) DO UPDATE SET """
+                     + ",".join(f"{key}=COALESCE(excluded.{key},tracks.{key})" for key in
+                                ("title", "artist", "album", "genre", "duration_ms", "cover_id", "release_year"))
+                     + ",updated_at=excluded.updated_at")
+        artist_sql = """INSERT INTO artist_images VALUES(?,?,?,?)
+            ON CONFLICT(user_id,artist) DO UPDATE SET
+            cover_id=COALESCE(NULLIF(excluded.cover_id,''),artist_images.cover_id), updated_at=excluded.updated_at"""
+        with self.connection() as conn:
+            if mode == "restore":
+                for table in ("plays", "tracks", "artist_images"):
+                    conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user,))
+            for t in clean_tracks:
+                guid = t["guid"].strip()
+                duration = t.get("duration_ms")
+                duration = duration if isinstance(duration, int) and not isinstance(duration, bool) and duration >= 0 else None
+                conn.execute(track_sql, (user, guid, self._clean_backup_text(t.get("title")),
+                                         self._clean_backup_text(t.get("artist")), self._clean_backup_text(t.get("album")),
+                                         self._clean_backup_text(t.get("genre"), 200), duration,
+                                         self._clean_backup_text(t.get("cover_id"), 128), None, now))
+                counts["tracks"] += 1
+            for a in clean_artists:
+                conn.execute(artist_sql, (user, a["artist"].strip(),
+                                          self._clean_backup_text(a.get("cover_id"), 128), now))
+                counts["artists"] += 1
+            for key, play in clean_plays:
+                cur = conn.execute("""INSERT OR IGNORE INTO plays
+                    (user_id,dedupe_key,guid,played_at,title,artist,album,genre,duration_ms,cover_id,source,confidence,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (user, key, play["guid"], play["played_at"], play["title"], play["artist"], play["album"],
+                     play["genre"], play["duration_ms"], play["cover_id"], play["source"], play["confidence"], now))
+                if cur.rowcount:
+                    counts["plays"] += 1
+        return counts
+
     def bounds(self, period, offset=0, now=None):
         if period not in ("week", "month", "year"):
             raise ValueError("period 必须是 week、month 或 year")

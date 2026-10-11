@@ -13,7 +13,7 @@
     reportRequest: 0, recordsRequest: 0, reportController: null, recordsController: null,
     records: { page: 1, size: 25, total: 0, q: '', period: 'report', start: null, end: null },
     reportFailed: false, recordsFailed: false, statusFailed: false, refreshing: false,
-    connectBusy: false, disconnectBusy: false, exportBusy: false,
+    connectBusy: false, disconnectBusy: false, exportBusy: false, importBusy: false,
     toastTimer: null, lastFocus: null, statusSignature: ''
   };
   const icon = '<svg viewBox="0 0 40 40" fill="none" aria-hidden="true"><path d="M13 28V12l17-4v17M13 12l17-4M13 17l17-4" stroke="currentColor" stroke-width="1.5"/><ellipse cx="9" cy="29" rx="4" ry="3" stroke="currentColor" stroke-width="1.5"/><ellipse cx="26" cy="26" rx="4" ry="3" stroke="currentColor" stroke-width="1.5"/></svg>';
@@ -1001,6 +1001,61 @@
   const storyStep = direction => { const scroll = $('#playback-scroll'); scroll.scrollBy({ top: direction * scroll.clientHeight, behavior: 'auto' }); };
   $('#playback-prev').addEventListener('click', () => storyStep(-1));
   $('#playback-next').addEventListener('click', () => storyStep(1));
+
+  // 备份与恢复：完整导出已由下载链接承担；导入读取备份文件，合并去重或恢复替换。
+  const backupState = { payload: null, restoreArmed: 0 };
+  $('#import-choose').addEventListener('click', () => $('#backup-file').click());
+  $('#backup-file').addEventListener('change', () => {
+    const file = $('#backup-file').files[0];
+    backupState.payload = null;
+    $('#import-submit').disabled = true;
+    $('#backup-summary').textContent = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const payload = JSON.parse(reader.result);
+        if (!payload || payload.format !== 'yinji-backup' || !Array.isArray(payload.plays)) throw new Error('格式');
+        backupState.payload = payload;
+        const exported = payload.exported_at ? `，导出于 ${dateFormat(payload.exported_at, { year: 'numeric', month: '2-digit', day: '2-digit' }, state.report?.timezone)}` : '';
+        $('#backup-summary').textContent = `已读取：${number(payload.plays.length)} 次播放 · ${number((payload.tracks || []).length)} 首曲目 · ${number((payload.artist_images || []).length)} 位歌手图片${exported}。`;
+        $('#import-submit').disabled = false;
+      } catch {
+        $('#backup-summary').textContent = '无法读取：不是有效的音迹备份文件。';
+      }
+    };
+    reader.readAsText(file);
+  });
+  $('#import-mode').addEventListener('change', () => { backupState.restoreArmed = 0; $('#import-submit').textContent = '导入'; });
+  $('#import-submit').addEventListener('click', async () => {
+    if (!backupState.payload || state.importBusy) return;
+    const mode = $('#import-mode').value;
+    if (mode === 'restore' && backupState.restoreArmed !== 2) {
+      backupState.restoreArmed += 1;
+      $('#import-submit').textContent = backupState.restoreArmed === 1 ? '再次点击确认恢复' : '确认：清空并恢复';
+      setTimeout(() => { backupState.restoreArmed = 0; $('#import-submit').textContent = '导入'; }, 5000);
+      return;
+    }
+    state.importBusy = true;
+    $('#import-submit').disabled = true;
+    try {
+      const result = await api(`/api/import?mode=${mode}`, { method: 'POST', body: JSON.stringify(backupState.payload) });
+      showToast(`导入完成：${number(result.plays || 0)} 次播放、${number(result.tracks || 0)} 首曲目、${number(result.artists || 0)} 位歌手${result.skipped ? `；跳过无效/重复 ${number(result.skipped)} 条` : ''}。`);
+      backupState.restoreArmed = 0;
+      $('#import-submit').textContent = '导入';
+      $('#backup-file').value = '';
+      $('#backup-summary').textContent = '';
+      backupState.payload = null;
+      $('#import-submit').disabled = true;
+      await refreshAll();
+    } catch (error) {
+      if (error.status === 401) authExpired();
+      else showError(`导入失败：${error.message}`);
+    } finally {
+      state.importBusy = false;
+      $('#import-submit').disabled = !backupState.payload;
+    }
+  });
 
 
   async function setPeriod(period, offset) {

@@ -52,6 +52,69 @@ class ArchiveTests(unittest.TestCase):
         # artists stay isolated per account
         self.assertEqual(self.archive.artist_covers("b"), {})
 
+    def test_export_restore_round_trip_replaces_account(self):
+        other = {"guid": "two", "title": "另一首", "artist": "另一歌手", "album": "另一专辑", "duration_ms": 200000}
+        self.archive.upsert_track("a", other)
+        self.archive.ingest("a", {"events": [self.event(self.now), self.event(self.now + timedelta(minutes=5), "two")]})
+        self.archive.upsert_artist("a", "歌手", "artist-image-id")
+        payload = self.archive.export_all("a")
+        self.assertEqual(payload["format"], "yinji-backup")
+        self.assertEqual(len(payload["plays"]), 2)
+        self.assertNotIn("user_id", payload["plays"][0])
+
+        fresh = Archive(self.temp.name + "_restore")
+        # the restoring account first had its own unrelated record
+        fresh.ingest("z", {"eventType": "track_play", "occurredAt": int(self.now.timestamp() * 1000),
+                           "payload": {"trackGUID": "old"}})
+        counts = fresh.restore_all("z", payload, "restore")
+        self.assertEqual(counts["plays"], 2)
+        self.assertEqual(counts["tracks"], 2)
+        self.assertEqual(counts["artists"], 1)
+        rows = fresh.records("z")
+        self.assertEqual(rows["total"], 2)
+        self.assertEqual(sorted(row["guid"] for row in rows["items"]), ["one", "two"])
+        self.assertEqual(sorted(row["title"] for row in rows["items"]), ["另一首", "歌曲"])
+        self.assertEqual(fresh.artist_covers("z"), {"歌手": "artist-image-id"})
+        # restore replaced the pre-existing unrelated record
+        self.assertEqual(fresh.track("z", "old"), {})
+
+    def test_export_merge_dedupes_across_accounts(self):
+        self.archive.ingest("a", {"events": [self.event(self.now)]})
+        payload = self.archive.export_all("a")
+        # account b only has the same track at a DIFFERENT time
+        self.archive.ingest("b", {"events": [self.event(self.now + timedelta(minutes=10))]})
+        counts = self.archive.restore_all("b", payload, "merge")
+        self.assertEqual(counts["plays"], 1, "the other account's unique play is added")
+        self.assertEqual(self.archive.records("b")["total"], 2)
+        # importing the same payload again dedupes completely
+        counts = self.archive.restore_all("b", payload, "merge")
+        self.assertEqual(counts["plays"], 0)
+        self.assertEqual(self.archive.records("b")["total"], 2)
+
+    def test_import_validation_skips_bad_rows(self):
+        payload = {"format": "yinji-backup", "version": 1, "plays": [
+            {"guid": "ok", "played_at": int(self.now.timestamp() * 1000), "confidence": "exact", "source": "import"},
+            {"guid": "", "played_at": 1},
+            {"guid": "bad-time", "played_at": 1},
+            {"guid": "dup", "played_at": int(self.now.timestamp() * 1000)},
+            {"guid": "dup", "played_at": int(self.now.timestamp() * 1000)},
+            "not-a-dict",
+        ], "tracks": [{"guid": "ok", "title": "标题"}], "artist_images": [{"artist": "歌手", "cover_id": "x"}]}
+        counts = self.archive.restore_all("b", payload, "merge")
+        self.assertEqual(counts["plays"], 2)
+        self.assertEqual(counts["tracks"], 1)
+        self.assertEqual(counts["artists"], 1)
+        self.assertEqual(counts["skipped"], 4)
+        confidences = sorted(row["confidence"] for row in self.archive.records("b")["items"])
+        self.assertEqual(confidences, ["exact", "observed"])
+
+    def test_import_rejects_invalid_payloads(self):
+        for bad in [None, {}, {"format": "other"}, {"format": "yinji-backup", "plays": "no"}]:
+            with self.assertRaises(ValueError):
+                self.archive.restore_all("b", bad, "merge")
+        with self.assertRaises(ValueError):
+            self.archive.restore_all("b", {"format": "yinji-backup", "plays": []}, "upsert")
+
     def test_month_and_leap_year_bounds(self):
         start, end, _ = self.archive.bounds("month", 1, self.now)
         self.assertEqual(start.isoformat(), "2024-02-01T00:00:00+08:00")

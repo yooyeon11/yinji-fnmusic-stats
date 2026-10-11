@@ -20,7 +20,7 @@ from .storage import Archive
 
 ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger("journal")
-VERSION = "1.1.5"
+VERSION = "1.2.0"
 MAX_BODY = 2 * 1024 * 1024
 HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"}
 LOGOUT_COOKIE = "journal_logout"
@@ -71,6 +71,8 @@ class Service:
         self.sync_lock = threading.Lock()
         self.attempts = {}
         self.stop = threading.Event()
+        self.backup_dirty = True
+        self.last_backup = 0.0
         self.poll_seconds = max(5, int(poll_seconds))
         self.trust_lan = bool(trust_lan)
         path = self.directory / "connection.json"
@@ -215,6 +217,7 @@ class Service:
     def capture(self, account, body, source):
         result = self.archive.ingest(account["user_id"], body, source)
         if result["accepted"]:
+            self.mark_backup_dirty()
             threading.Thread(target=self.enrich, args=(account, body), daemon=True).start()
         return result
 
@@ -223,11 +226,44 @@ class Service:
         from .poller import detect
         result = detect(self.archive, account, MusicClient(account["server"], account["token"]))
         if result.get("recorded"):
+            self.mark_backup_dirty()
             log.info("Playback detection recorded %s play(s)%s", result["recorded"],
                      " after realignment" if result.get("unaligned") else "")
         elif result.get("unaligned"):
             log.info("Playback history was reordered or trimmed server-side; nothing attributable")
         return result
+
+    def mark_backup_dirty(self):
+        with self.lock:
+            self.backup_dirty = True
+
+    def run_backup(self):
+        """Always-on local backup: whenever recorded data changed, write the
+        complete payload to data_dir/exports/yinji-backup.json, throttled to
+        at most one write per minute. The file contains listening records and
+        metadata only — never sessions or the fnMusic token."""
+        while not self.stop.is_set():
+            self.stop.wait(15)
+            if self.stop.is_set():
+                break
+            with self.lock:
+                if not self.backup_dirty or time.time() - self.last_backup < 60:
+                    continue
+                accounts = list(self.accounts.values())
+                self.backup_dirty = False
+                self.last_backup = time.time()
+            for account in accounts:
+                try:
+                    payload = self.archive.export_all(account["user_id"])
+                    payload["account"] = {"name": account["user"].get("name") or account["user"].get("username")}
+                    directory = self.directory / "exports"
+                    directory.mkdir(parents=True, exist_ok=True)
+                    target = directory / "yinji-backup.json"
+                    temporary = target.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                    temporary.replace(target)
+                except Exception as exc:
+                    log.warning("Auto backup failed: %s", type(exc).__name__)
 
     def run_sync(self):
         while not self.stop.is_set():
@@ -302,14 +338,15 @@ class Handler(BaseHTTPRequestHandler):
     def failure(self, status, message):
         self.send(status, {"ok": False, "error": message})
 
-    def read_body(self):
+    def read_body(self, limit=None):
+        cap = limit or MAX_BODY
         if self.headers.get("Transfer-Encoding"):
             raise ValueError("不支持分块请求")
         size = int(self.headers.get("Content-Length", "0"))
-        if not 0 <= size <= MAX_BODY:
+        if not 0 <= size <= cap:
             # Drain a bounded amount so the client can read the error response
             # instead of seeing a connection reset mid-upload.
-            remaining = min(size, MAX_BODY * 8) if size > 0 else 0
+            remaining = min(size, cap * 8) if size > 0 else 0
             while remaining > 0:
                 chunk = self.rfile.read(min(65536, remaining))
                 if not chunk:
@@ -392,6 +429,11 @@ class Handler(BaseHTTPRequestHandler):
             user_id = account["user_id"]
             start = int(query["start"]) if query.get("start") else None
             end = int(query["end"]) if query.get("end") else None
+            if path == "/api/export/full":
+                payload = archive.export_all(user_id)
+                payload["account"] = {"name": account["user"].get("name") or account["user"].get("username")}
+                return self.send(200, payload, "application/json",
+                                 {"Content-Disposition": f'attachment; filename="yinji-backup-{time.strftime("%Y%m%d")}.json"'})
             if path == "/api/report":
                 return self.send(200, archive.report(user_id, query.get("period", "week"), int(query.get("offset", 0))))
             if path == "/api/records":
@@ -433,7 +475,7 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/music/"):
                 account = self.authorized()
                 return self.proxy(account) if account else None
-            raw = self.read_body()
+            raw = self.read_body(64 * 1024 * 1024) if path == "/api/import" else self.read_body()
             if "application/json" not in self.headers.get("Content-Type", ""):
                 return self.failure(415, "请使用 JSON 请求")
             body = json.loads(raw or b"{}")
@@ -482,6 +524,11 @@ class Handler(BaseHTTPRequestHandler):
                 if owner and owner != account["user_id"]:
                     return self.failure(409, "账号已切换，请回到对应账号后同步待发记录")
                 return self.send(200, self.service.capture(account, body, "browser_bridge"))
+            if path == "/api/import":
+                mode = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("mode", ["merge"])[-1]
+                counts = self.service.archive.restore_all(account["user_id"], body, mode)
+                self.service.mark_backup_dirty()
+                return self.send(200, {"ok": True, **counts})
             return self.failure(404, "接口不存在")
         except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             self.failure(400, str(exc))
@@ -616,6 +663,7 @@ def main():
     httpd.service = service
     threading.Thread(target=service.run_sync, daemon=True).start()
     threading.Thread(target=service.run_poller, daemon=True).start()
+    threading.Thread(target=service.run_backup, daemon=True).start()
     log.info("音迹 %s: http://%s:%s", VERSION, args.host, args.port)
     try:
         httpd.serve_forever()
