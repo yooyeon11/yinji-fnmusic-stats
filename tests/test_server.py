@@ -374,6 +374,23 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(status_body["connected"])
 
+    def test_cover_query_token_and_restore_endpoint(self):
+        # <img> requests cannot carry the token header, so covers also accept
+        # the session token in the ?s= query parameter.
+        status, _, body = self.json_request("POST", "/api/connect", {
+            "server": self.nas.origin, "username": "dave", "password": "credential-secret"})
+        self.assertEqual(status, 200)
+        token = body["session"]
+        status, _, image = self.request("GET", f"/api/covers/cover-one?s={token}", cookie=None)
+        self.assertEqual(status, 200, image[:120])
+        status, _, _ = self.request("GET", "/api/covers/cover-one?s=forged", cookie=None)
+        self.assertEqual(status, 401)
+        # one-click escape from the per-device logout marker
+        status, headers, _ = self.request("GET", "/?restore=1")
+        self.assertEqual(status, 200)
+        self.assertIn("journal_logout=", headers["Set-Cookie"])
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+
     def test_private_endpoints_require_real_session(self):
         for path in ("/api/report", "/api/records", "/api/export", "/api/export/full",
                      "/api/covers/cover-one"):

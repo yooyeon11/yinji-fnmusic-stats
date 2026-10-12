@@ -57,10 +57,35 @@
   }
   // Session fallback for browsers/webviews that drop cookies: the login
   // response hands the token to the page and every request echoes it back.
+  // localStorage first; when a webview disables it, a JS-readable cookie keeps
+  // the token across page loads (the server's HttpOnly cookie is unaffected).
   const SESSION_KEY = 'yinji_session';
-  const storedSession = () => { try { return window.localStorage.getItem(SESSION_KEY) || ''; } catch { return ''; } };
-  const setStoredSession = token => { try { token ? window.localStorage.setItem(SESSION_KEY, token) : window.localStorage.removeItem(SESSION_KEY); } catch { /* storage unavailable */ } };
+  const readTokenCookie = () => {
+    const match = document.cookie.match(/(?:^|;\s*)yinji_session=([^;]*)/);
+    return match ? decodeURIComponent(match[1]) : '';
+  };
+  const storedSession = () => {
+    try { const value = window.localStorage.getItem(SESSION_KEY); if (value) return value; } catch { /* storage unavailable */ }
+    return readTokenCookie();
+  };
+  const setStoredSession = token => {
+    try {
+      if (token) window.localStorage.setItem(SESSION_KEY, token);
+      else window.localStorage.removeItem(SESSION_KEY);
+    } catch { /* storage unavailable */ }
+    try {
+      document.cookie = token
+        ? `${SESSION_KEY}=${encodeURIComponent(token)}; Path=/; Max-Age=2592000; SameSite=Strict`
+        : `${SESSION_KEY}=; Path=/; Max-Age=0; SameSite=Strict`;
+    } catch { /* cookie writes unavailable */ }
+  };
   const sessionHeader = () => { const token = storedSession(); return token ? { 'X-Journal-Session': token } : {}; };
+  // Album art is loaded by <img>, which cannot send the token header, so the
+  // token rides in the URL instead.
+  const coverSrc = id => {
+    const token = storedSession();
+    return `/api/covers/${encodeURIComponent(String(id))}${token ? `?s=${encodeURIComponent(token)}` : ''}`;
+  };
   async function api(path, options = {}) {
     const controller = new AbortController();
     const outer = options.signal;
@@ -109,7 +134,7 @@
   function fallbackCover() { return `<span class="cover-placeholder" aria-hidden="true">${icon}</span>`; }
   function cover(coverId, className = '') {
     if (coverId === null || coverId === undefined || coverId === '') return `<span class="${className}">${fallbackCover()}</span>`;
-    return `<span class="${className}"><img src="/api/covers/${encodeURIComponent(String(coverId))}" loading="lazy" alt="" referrerpolicy="same-origin"></span>`;
+    return `<span class="${className}"><img src="${coverSrc(coverId)}" loading="lazy" alt="" referrerpolicy="same-origin"></span>`;
   }
   // Broken or expired covers remain honest, decorative placeholders, not stock art.
   document.addEventListener('error', event => {
@@ -183,6 +208,7 @@
     }
     $('#connected-account').hidden = !isConnected;
     $('#change-account').hidden = !isConnected;
+    $('#restore-share').hidden = isConnected;
     $('#connection-form').hidden = isConnected;
     if (isConnected) {
       text('#account-name', status.user?.name || '飞牛音乐账号');
@@ -329,7 +355,7 @@
       $('#report-empty-action').dataset.play = '';
     }
     const representativeCover = report.tops?.artists?.[0]?.cover_id || report.tops?.albums?.[0]?.cover_id;
-    document.body.style.setProperty('--year-cover', representativeCover ? `url("/api/covers/${encodeURIComponent(String(representativeCover))}")` : 'none');
+    document.body.style.setProperty('--year-cover', representativeCover ? `url("${coverSrc(representativeCover)}")` : 'none');
     const previous = count(report.previous?.plays);
     const period = PERIODS[state.period];
     text('#cover-plays', number(plays));
@@ -777,6 +803,7 @@
     $('#connection-form').hidden = !$('#connection-form').hidden;
     if (!$('#connection-form').hidden) $('#server-input').focus();
   });
+  $('#restore-share').addEventListener('click', () => { window.location.href = '/?restore=1'; });
   document.addEventListener('click', event => {
     if (event.target.closest('[data-connect]')) openSettings();
     if (event.target.closest('[data-retry]')) refreshAll();
@@ -914,7 +941,7 @@
 
   // 年度 Playback 故事：按 Last.fm Playback 的真实版式复刻（章节配色、全出血封面、翻页导航），数据全部来自当年报告。
   const storyState = { open: false, observer: null, onScroll: null, onKey: null, returnFocus: null };
-  const storyBg = coverId => coverId ? `<div class="story-backdrop" style="background-image:url('/api/covers/${encodeURIComponent(String(coverId))}')"></div><div class="story-shade"></div>` : '<div class="story-shade plain"></div>';
+  const storyBg = coverId => coverId ? `<div class="story-backdrop" style="background-image:url('${coverSrc(coverId)}')"></div><div class="story-shade"></div>` : '<div class="story-shade plain"></div>';
   function buildStory(report) {
     const year = dateFormat(report.start, { year: 'numeric' }, report.timezone).replace('年', '');
     const totals = report.totals || {};

@@ -17,7 +17,7 @@ from .storage import Archive
 
 ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger("journal")
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 MAX_BODY = 2 * 1024 * 1024
 LOGOUT_COOKIE = "journal_logout"
 _DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -129,14 +129,16 @@ class Service:
                 return None
             return self.accounts.get(value["account"])
 
-    def resolve(self, cookie, peer, header_token=""):
+    def resolve(self, cookie, peer, header_token="", ignore_logout_marker=False):
         """Session for one request: cookie or client token, then the shared
         internal session.
 
         When a connection is saved and the request comes from the internal
         network, every device shares that account without logging in again.
         A browser that explicitly logged out (marker cookie) is excluded, and
-        the whole behaviour is disabled with trust_lan=False.
+        the whole behaviour is disabled with trust_lan=False. Read-only album
+        art passes ignore_logout_marker=True: an <img> request cannot carry the
+        client token header, and artwork is not the listening archive.
         """
         account = self.session(cookie, header_token)
         if account is not None:
@@ -147,7 +149,7 @@ class Service:
             parsed = cookies.SimpleCookie(cookie or "")
         except cookies.CookieError:
             return None
-        if LOGOUT_COOKIE in parsed:
+        if LOGOUT_COOKIE in parsed and not ignore_logout_marker:
             return None
         with self.lock:
             if not self.accounts:
@@ -301,7 +303,18 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(size)
 
     def client_token(self):
-        return self.headers.get("X-Journal-Session", "")
+        """Session token from the request header, or the ?s= query parameter.
+
+        The query form exists only so <img> requests (album art) can be
+        authorized in browsers that drop cookies: image loads cannot carry
+        custom headers. Request logging records the path without its query.
+        """
+        token = self.headers.get("X-Journal-Session", "")
+        if token:
+            return token
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        values = query.get("s") or []
+        return values[-1] if values else ""
 
     def authorized(self):
         account = self.service.resolve(self.headers.get("Cookie"), self.client_address[0], self.client_token())
@@ -369,6 +382,38 @@ class Handler(BaseHTTPRequestHandler):
                                   "server": account["server"], "last_sync": self.service.archive.get_state(user_id, "last_sync"),
                                   "error": self.service.archive.get_state(user_id, "error"), "collection": self.service.archive.status(user_id),
                                   "notice": "播放由轮询探测记录：定时读取飞牛播放历史，时间按首次发现估算；无真实时间的旧历史不会回填。"})
+        if path.startswith("/api/covers/"):
+            # Artwork only: <img> requests cannot carry the client token header,
+            # so the LAN share applies even for a device with the logout marker.
+            account = self.service.resolve(self.headers.get("Cookie"), self.client_address[0],
+                                           self.client_token(), ignore_logout_marker=True)
+            if not account:
+                return self.failure(401, "请先登录飞牛账号")
+            from .connector import MusicClient
+            cover_id = urllib.parse.unquote(path[len("/api/covers/"):])
+            if not cover_id or len(cover_id) > 128 or not all(c.isalnum() or c in "_-" for c in cover_id):
+                return self.failure(400, "无效封面")
+            try:
+                body, ctype = MusicClient(account["server"], account["token"]).cover(cover_id)
+            except Exception:
+                return self.send(404, b"", "image/png")
+            if not ctype.startswith("image/"):
+                return self.failure(502, "无效封面响应")
+            return self.send(200, body, ctype)
+        if path == "/api/diagnostics":
+            peer = self.client_address[0]
+            try:
+                parsed_cookies = cookies.SimpleCookie(self.headers.get("Cookie", ""))
+            except cookies.CookieError:
+                parsed_cookies = cookies.SimpleCookie()
+            return self.send(200, {
+                "version": VERSION, "peer": peer, "private_peer": private_peer(peer),
+                "trust_lan": self.service.trust_lan, "accounts_saved": len(self.service.accounts),
+                "cookie_session": bool(self.service.session(self.headers.get("Cookie"))),
+                "token_session": bool(self.service.session("", self.client_token())),
+                "logout_marker": LOGOUT_COOKIE in parsed_cookies,
+                "host": self.headers.get("Host", ""),
+            })
         if path.startswith("/api/"):
             account = self.authorized()
             if not account:
@@ -389,26 +434,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/export":
                 body = archive.export(user_id, query.get("q", "")[:200], start, end)
                 return self.send(200, body, "text/csv; charset=utf-8", {"Content-Disposition": 'attachment; filename="music-journal.csv"'})
-            if path.startswith("/api/covers/"):
-                from .connector import MusicClient
-                cover_id = urllib.parse.unquote(path[len("/api/covers/"):])
-                if not cover_id or len(cover_id) > 128 or not all(c.isalnum() or c in "_-" for c in cover_id):
-                    return self.failure(400, "无效封面")
-                try:
-                    body, ctype = MusicClient(account["server"], account["token"]).cover(cover_id)
-                except Exception:
-                    return self.send(404, b"", "image/png")
-                if not ctype.startswith("image/"):
-                    return self.failure(502, "无效封面响应")
-                return self.send(200, body, ctype)
             return self.failure(404, "接口不存在")
         allowed = {"/": "index.html", "/app.css": "app.css", "/app.js": "app.js", "/theme.js": "theme.js", "/favicon.svg": "assets/icon.svg"}
         file = allowed.get(path)
         if not file:
             return self.failure(404, "页面不存在")
         types = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8", ".svg": "image/svg+xml"}
-        return self.send(200, (ROOT / "web" / file).read_bytes(), types[Path(file).suffix],
-                         {"Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"})
+        headers = {"Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"}
+        if query.get("restore") == "1":
+            # One-click escape from the per-device logout marker: the page
+            # clears it so LAN auto-share works again on this device.
+            headers["Set-Cookie"] = f"{LOGOUT_COOKIE}=; SameSite=Strict; Path=/; Max-Age=0"
+        return self.send(200, (ROOT / "web" / file).read_bytes(), types[Path(file).suffix], headers)
 
     def do_POST(self):
         try:
