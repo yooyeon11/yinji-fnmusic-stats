@@ -17,7 +17,7 @@ from .storage import Archive
 
 ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger("journal")
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 MAX_BODY = 2 * 1024 * 1024
 LOGOUT_COOKIE = "journal_logout"
 _DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -97,13 +97,22 @@ class Service:
             temporary.replace(path)
         return key
 
-    def session(self, cookie):
+    def session(self, cookie, header_token=""):
+        """Session lookup: HttpOnly cookie first, then an explicit client token.
+
+        Embedded webviews and strict privacy modes can drop the session cookie
+        entirely; the login response therefore also hands the token to the page
+        (stored in localStorage) and the client echoes it back in
+        X-Journal-Session, which works without any cookie support.
+        """
         try:
             parsed = cookies.SimpleCookie(cookie or "")
             token = parsed["journal_session"].value if "journal_session" in parsed else ""
         except cookies.CookieError:
-            return None
-        if not token:
+            token = ""
+        if not token and isinstance(header_token, str):
+            token = header_token.strip()
+        if not token or len(token) > 256:
             return None
         with self.lock:
             value = self.sessions.get(token)
@@ -120,15 +129,16 @@ class Service:
                 return None
             return self.accounts.get(value["account"])
 
-    def resolve(self, cookie, peer):
-        """Session for one request: cookie first, then the shared internal session.
+    def resolve(self, cookie, peer, header_token=""):
+        """Session for one request: cookie or client token, then the shared
+        internal session.
 
         When a connection is saved and the request comes from the internal
         network, every device shares that account without logging in again.
         A browser that explicitly logged out (marker cookie) is excluded, and
         the whole behaviour is disabled with trust_lan=False.
         """
-        account = self.session(cookie)
+        account = self.session(cookie, header_token)
         if account is not None:
             return account
         if not self.trust_lan or not private_peer(peer):
@@ -290,8 +300,11 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("请求体过大")
         return self.rfile.read(size)
 
+    def client_token(self):
+        return self.headers.get("X-Journal-Session", "")
+
     def authorized(self):
-        account = self.service.resolve(self.headers.get("Cookie"), self.client_address[0])
+        account = self.service.resolve(self.headers.get("Cookie"), self.client_address[0], self.client_token())
         if not account:
             self.failure(401, "请先登录飞牛账号")
         return account
@@ -347,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/health":
             return self.send(200, {"ok": True, "version": VERSION})
         if path == "/api/status":
-            account = self.service.resolve(self.headers.get("Cookie"), self.client_address[0])
+            account = self.service.resolve(self.headers.get("Cookie"), self.client_address[0], self.client_token())
             if not account:
                 return self.send(200, {"connected": False, "needs_login": True, "server": self.service.default_server,
                                        "notice": "请登录飞牛账号以查看私人收听记录"})
@@ -428,7 +441,8 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     log.warning("Connection rejected: %s", type(exc).__name__)
                     return self.failure(401, "连接失败：请检查飞牛地址、账号密码和网络")
-                return self.send(200, {"ok": True, "user": {"name": account["user"].get("name") or username}},
+                return self.send(200, {"ok": True, "user": {"name": account["user"].get("name") or username},
+                                       "session": session},
                                  headers=[("Set-Cookie", f"{LOGOUT_COOKIE}=; SameSite=Strict; Path=/; Max-Age=0"),
                                           ("Set-Cookie", f"journal_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800")])
             account = self.authorized()
@@ -437,6 +451,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/disconnect":
                 parsed = cookies.SimpleCookie(self.headers.get("Cookie", ""))
                 token = parsed["journal_session"].value if "journal_session" in parsed else ""
+                token = token or self.client_token()
                 with self.service.lock:
                     self.service.sessions.pop(token, None)
                 self.service.archive.drop_session(token)

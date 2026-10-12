@@ -182,7 +182,9 @@ class ServerTests(unittest.TestCase):
         status, headers, body = self.json_request("POST", "/api/connect", {
             "server": self.nas.origin + "/music/", "username": username, "password": "credential-secret"})
         self.assertEqual(status, 200, body)
-        self.assertEqual(body, {"ok": True, "user": {"name": username}})
+        self.assertEqual(body["ok"], True)
+        self.assertEqual(body["user"], {"name": username})
+        self.assertTrue(body["session"])
         return headers["Set-Cookie"].split(";", 1)[0]
 
     def import_plays(self, plays, cookie=None):
@@ -347,6 +349,30 @@ class ServerTests(unittest.TestCase):
         self.assertIsNone(fresh.session("journal_session=stale-token"))
         self.assertIsNone(fresh.archive.load_session("stale-token"))
 
+
+    def test_session_header_works_without_cookies(self):
+        # Embedded webviews and strict privacy modes can drop cookies entirely;
+        # the login response also hands the token to the page, which echoes it
+        # back in X-Journal-Session.
+        status, _, body = self.json_request("POST", "/api/connect", {
+            "server": self.nas.origin, "username": "carol", "password": "credential-secret"})
+        self.assertEqual(status, 200)
+        token = body["session"]
+        header = {"X-Journal-Session": token}
+        status, _, status_body = self.json_request("GET", "/api/status", cookie=None, headers=header)
+        self.assertEqual(status, 200)
+        self.assertTrue(status_body["connected"])
+        self.assertEqual(status_body["user"]["name"], "carol")
+        status, _, _ = self.json_request("GET", "/api/records", cookie=None, headers=header)
+        self.assertEqual(status, 200)
+        status, _, _ = self.json_request("GET", "/api/records", cookie=None,
+                                         headers={"X-Journal-Session": "forged-token"})
+        self.assertEqual(status, 401)
+        status, _, _ = self.json_request("POST", "/api/disconnect", {}, cookie=None, headers=header)
+        self.assertEqual(status, 200)
+        status, _, status_body = self.json_request("GET", "/api/status", cookie=None, headers=header)
+        self.assertEqual(status, 200)
+        self.assertFalse(status_body["connected"])
 
     def test_private_endpoints_require_real_session(self):
         for path in ("/api/report", "/api/records", "/api/export", "/api/export/full",

@@ -55,6 +55,12 @@
   class ApiError extends Error {
     constructor(message, status = 0) { super(message); this.status = status; }
   }
+  // Session fallback for browsers/webviews that drop cookies: the login
+  // response hands the token to the page and every request echoes it back.
+  const SESSION_KEY = 'yinji_session';
+  const storedSession = () => { try { return window.localStorage.getItem(SESSION_KEY) || ''; } catch { return ''; } };
+  const setStoredSession = token => { try { token ? window.localStorage.setItem(SESSION_KEY, token) : window.localStorage.removeItem(SESSION_KEY); } catch { /* storage unavailable */ } };
+  const sessionHeader = () => { const token = storedSession(); return token ? { 'X-Journal-Session': token } : {}; };
   async function api(path, options = {}) {
     const controller = new AbortController();
     const outer = options.signal;
@@ -65,7 +71,7 @@
     try {
       const response = await fetch(path, {
         ...options, credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
-        headers: { Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers }
+        headers: { Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...sessionHeader(), ...options.headers }
       });
       let data;
       try { data = await response.json(); }
@@ -197,6 +203,7 @@
     return status;
   }
   function authExpired() {
+    setStoredSession('');
     state.status = { connected: false, needs_login: true, notice: '请登录飞牛账号以查看私人收听记录' };
     state.reportController?.abort();
     state.recordsController?.abort();
@@ -798,7 +805,8 @@
     text('#connect-submit', '正在连接…');
     let success = false;
     try {
-      await api('/api/connect', { method: 'POST', body: JSON.stringify({ server, username, password: $('#password-input').value }) });
+      const result = await api('/api/connect', { method: 'POST', body: JSON.stringify({ server, username, password: $('#password-input').value }) });
+      if (result?.session) setStoredSession(result.session);
       $('#password-input').value = '';
       state.report = null;
       state.records.page = 1;
@@ -831,6 +839,7 @@
     $('#connection-error').hidden = true;
     try {
       await api('/api/disconnect', { method: 'POST', body: '{}' });
+      setStoredSession('');
       state.status = { connected: false, needs_login: true };
       state.reportController?.abort();
       state.recordsController?.abort();
@@ -1013,8 +1022,33 @@
   $('#playback-prev').addEventListener('click', () => storyStep(-1));
   $('#playback-next').addEventListener('click', () => storyStep(1));
 
-  // 备份与恢复：完整导出已由下载链接承担；导入读取备份文件，合并去重或恢复替换。
+  // 备份与恢复：完整导出已由下载按钮承担（经 fetch 携带会话头，兼容禁用 Cookie 的浏览器）；导入读取备份文件，合并去重或恢复替换。
   const backupState = { payload: null, restoreArmed: 0 };
+  $('#download-backup').addEventListener('click', async () => {
+    if (state.exportBusy) return;
+    state.exportBusy = true;
+    $('#download-backup').disabled = true;
+    try {
+      const response = await fetch('/api/export/full', { credentials: 'same-origin', cache: 'no-store', headers: sessionHeader() });
+      if (!response.ok) throw new ApiError(`下载失败（HTTP ${response.status}）。`, response.status);
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `音迹-完整备份-${localDate(new Date())}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      showToast('完整备份已下载，请保存到 NAS 之外的地方。');
+    } catch (error) {
+      if (error.status === 401) authExpired();
+      else showError(`下载备份失败：${error.message}`);
+    } finally {
+      state.exportBusy = false;
+      $('#download-backup').disabled = false;
+    }
+  });
   $('#import-choose').addEventListener('click', () => $('#backup-file').click());
   $('#backup-file').addEventListener('change', () => {
     const file = $('#backup-file').files[0];
@@ -1183,7 +1217,7 @@
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60000);
     try {
-      const response = await fetch(`/api/export?${recordParams(false)}`, { credentials: 'same-origin', cache: 'no-store', signal: controller.signal });
+      const response = await fetch(`/api/export?${recordParams(false)}`, { credentials: 'same-origin', cache: 'no-store', signal: controller.signal, headers: sessionHeader() });
       if (!response.ok) {
         let message = `导出失败（HTTP ${response.status}）。`;
         try { const data = await response.json(); message = data.error?.message || data.error || data.message || message; } catch { /* Keep HTTP detail. */ }
