@@ -199,13 +199,6 @@
     const name = isConnected ? status.user?.name || '我的音乐' : '你的音乐，音迹可循';
     text('#header-user', isConnected ? '连接设置' : '连接飞牛账号');
     text('#header-avatar', isConnected ? (name.slice(0, 1).toUpperCase() || '♫') : '♫');
-    const player = $('#open-player');
-    if (isConnected && status?.server) {
-      player.href = status.server + '/music/';
-      player.hidden = false;
-    } else {
-      player.hidden = true;
-    }
     $('#connected-account').hidden = !isConnected;
     $('#change-account').hidden = !isConnected;
     $('#restore-share').hidden = isConnected;

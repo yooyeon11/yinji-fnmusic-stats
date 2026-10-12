@@ -17,7 +17,7 @@ from .storage import Archive
 
 ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger("journal")
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 MAX_BODY = 2 * 1024 * 1024
 LOGOUT_COOKIE = "journal_logout"
 _DEFAULT_PORTS = {"http": 80, "https": 443}
