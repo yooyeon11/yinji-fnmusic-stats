@@ -26,7 +26,7 @@ INNER_REQUIRED = ["ui/config", "ui/images/icon_64.png", "ui/images/icon_256.png"
                   "server/app/connector.py", "server/app/poller.py",
                   "server/app/report_extras.py", "server/app/timezones.py",
                   "server/web/index.html", "server/web/app.css", "server/web/app.js",
-                  "server/web/theme.js", "server/web/collector.js", "server/web/assets/icon.svg"]
+                  "server/web/theme.js", "server/web/assets/icon.svg"]
 FRESHNESS = [
     ("app/server.py", "server/app/server.py"),
     ("app/storage.py", "server/app/storage.py"),
@@ -38,7 +38,6 @@ FRESHNESS = [
     ("web/app.css", "server/web/app.css"),
     ("web/app.js", "server/web/app.js"),
     ("web/theme.js", "server/web/theme.js"),
-    ("web/collector.js", "server/web/collector.js"),
     ("README.md", "server/README.md"),
 ]
 

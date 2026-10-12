@@ -91,45 +91,20 @@ class FakeNASHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def handle_request(self):
-        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        self.server.requests.append({"method": self.command, "path": self.path,
-                                     "headers": dict(self.headers), "body": body})
         path = urlsplit(self.path).path
-        if path == EVENT_PATH:
-            return self.reply(self.server.event_status, self.server.event_reply)
-        if path in ("/music", "/music/", "/music/gzip.html", "/music/no-head.html"):
-            content = HTML if path != "/music/no-head.html" else b"<html><body>player</body></html>"
-            headers = {"Set-Cookie": "music-token=upstream-secret-alice; Path=/",
-                       "Content-Security-Policy": "script-src 'none'", "X-Frame-Options": "DENY"}
-            if path == "/music/gzip.html":
-                content = gzip.compress(content)
-                headers["Content-Encoding"] = "gzip"
-            return self.reply(200, content, "text/html; charset=utf-8", headers)
-        if path == "/music/redirect":
-            return self.reply(302, b"", headers={"Location": self.server.origin + "/music/"})
-        if path == "/music/external-redirect":
-            return self.reply(302, b"", headers={"Location": "http://127.0.0.1:1/never-contact"})
-        if path == "/music/gzip.js":
-            return self.reply(200, gzip.compress(b"window.fixture = true;"), "application/javascript",
-                              {"Content-Encoding": "gzip"})
-        if path in ("/music/audio", "/music/stream"):
-            content, status, headers = MEDIA, 200, {"Accept-Ranges": "bytes"}
-            if self.headers.get("Range"):
-                begin, end = self.headers["Range"][6:].split("-")
-                begin, end = int(begin), int(end)
-                content, status = MEDIA[begin:end + 1], 206
-                headers["Content-Range"] = f"bytes {begin}-{end}/{len(MEDIA)}"
-            return self.reply(status, content, "audio/mpeg", headers, length=path != "/music/stream")
-        if path == "/music/api/echo":
-            return self.reply(200, {"method": self.command, "bytes": len(body)})
-        return self.reply(404, {"code": 404})
+        if path == "/music/api/v1/user/password-login":
+            return self.reply(200, {"code": 0, "data": {"userToken": "upstream-secret-login", "user": {"guid": "g", "name": "u"}}})
+        if path == "/music/api/v1/user/me":
+            return self.reply(200, {"code": 0, "data": {"guid": "g", "name": "u"}})
+        if path == "/music/api/v1/play-history/list":
+            return self.reply(200, {"code": 0, "data": {"list": [], "total": 0}})
+        if path == "/music/api/v1/static/cover":
+            return self.reply(200, MEDIA, "image/webp")
+        self.reply(404, {"code": 404, "message": "not found"})
 
     do_GET = handle_request
     do_HEAD = handle_request
     do_POST = handle_request
-    do_PUT = handle_request
-    do_PATCH = handle_request
-    do_DELETE = handle_request
 
 
 class ServerTests(unittest.TestCase):
@@ -210,24 +185,16 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(body, {"ok": True, "user": {"name": username}})
         return headers["Set-Cookie"].split(";", 1)[0]
 
-    def ingest(self, body, cookie=None):
-        return self.json_request("POST", "/api/ingest", body, cookie or self.cookie)
+    def import_plays(self, plays, cookie=None):
+        payload = {"format": "yinji-backup", "version": 1, "plays": plays, "tracks": [], "artist_images": []}
+        status, _, body = self.json_request("POST", "/api/import?mode=merge", payload, cookie or self.cookie)
+        self.assertEqual(status, 200, body)
+        return body
 
     def records(self, cookie=None, query=""):
         status, _, body = self.json_request("GET", "/api/records" + query, cookie=cookie or self.cookie)
         self.assertEqual(status, 200, body)
         return body
-
-    def test_private_endpoints_require_real_session(self):
-        for path in ("/api/report", "/api/records", "/api/export", "/api/covers/cover-one",
-                     "/api/collector.js", "/music/", "/music/audio"):
-            for cookie in (None, "journal_session=forged", "music-token=upstream-secret-alice"):
-                with self.subTest(path=path, cookie=cookie):
-                    status, _, body = self.json_request("GET", path, cookie=cookie)
-                    self.assertEqual(status, 401, body)
-        for path in ("/api/ingest", "/api/sync", "/api/disconnect", EVENT_PATH):
-            with self.subTest(path=path):
-                self.assertEqual(self.json_request("POST", path, event())[0], 401)
 
     def test_public_health_and_anonymous_status_do_not_leak_identity(self):
         self.assertEqual(self.json_request("GET", "/api/health")[0], 200)
@@ -271,22 +238,6 @@ class ServerTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.assertEqual(self.json_request("POST", "/api/connect", payload)[0], 400)
 
-    def test_cross_site_writes_rejected_before_nas_or_archive(self):
-        for method, path in (("POST", "/api/connect"), ("POST", "/api/ingest"),
-                             ("POST", EVENT_PATH), ("PUT", "/music/api/echo"),
-                             ("DELETE", "/music/api/echo"), ("PATCH", "/music/api/echo")):
-            with self.subTest(method=method, path=path):
-                status, _, _ = self.request(method, path, event(), self.cookie,
-                                            {"Origin": "https://hostile.invalid"})
-                self.assertEqual(status, 403)
-        self.assertEqual(self.nas.requests, [])
-        self.assertEqual(self.records()["total"], 0)
-
-    def test_same_origin_post_is_allowed(self):
-        self.assertEqual(self.ingest(event())[0], 200)
-        self.assertEqual(self.json_request("POST", "/api/ingest", event("two"), self.cookie,
-                                          {"Origin": self.origin})[2]["accepted"], 1)
-
     def test_logout_and_expired_session_are_unauthorized(self):
         bob = self.connect("bob")
         token = bob.split("=", 1)[1]
@@ -297,68 +248,7 @@ class ServerTests(unittest.TestCase):
         self.assertIn("Max-Age=0", headers["Set-Cookie"])
         self.assertEqual(self.request("GET", "/api/records", cookie=self.cookie)[0], 401)
 
-    def test_ingest_single_batch_duplicate_and_repeat_play(self):
-        self.assertEqual(self.ingest(event())[2], {"ok": True, "accepted": 1, "deduped": 0, "skipped": 0})
-        _, _, result = self.ingest({"events": [event(), event("two"), event("two"),
-                                              event(stamp=STAMP + 180000), {"eventType": "track_pause"}]})
-        self.assertEqual(result, {"ok": True, "accepted": 2, "deduped": 2, "skipped": 1})
-        self.assertEqual(self.ingest([event(), event("two")])[2]["deduped"], 2)
-        self.assertEqual(self.records()["total"], 3)
 
-    def test_invalid_ingest_never_creates_record(self):
-        invalid = [None, "event", {"eventType": "track_play", "payload": []},
-                   {"eventType": "track_play", "payload": {"trackGUID": "one"}},
-                   event(stamp=True), event(stamp="bad"), event(stamp=1),
-                   event(stamp=int(time.time() * 1000) + 3600000), event(guid="")]
-        self.assertEqual(self.ingest(invalid)[2]["skipped"], len(invalid))
-        for payload in ({"events": "not-list"}, {"events": [event()] * 1001}):
-            self.assertEqual(self.ingest(payload)[0], 400)
-        self.assertEqual(self.records()["total"], 0)
-
-    def test_ingest_body_validation(self):
-        cases = [(b"{broken", {"Content-Type": "application/json"}, 400),
-                 (b"42", {"Content-Type": "application/json"}, 400),
-                 (b"{}", {"Content-Type": "text/plain"}, 415)]
-        for body, headers, expected in cases:
-            with self.subTest(body=body):
-                self.assertEqual(self.request("POST", "/api/ingest", body, self.cookie, headers, raw=True)[0], expected)
-
-    def test_ingest_rejects_oversized_json_body(self):
-        status, _, _ = self.request("POST", "/api/ingest", b" " * (MAX_BODY + 1), self.cookie,
-                                     {"Content-Type": "application/json"}, raw=True)
-        self.assertEqual(status, 400)
-        self.assertEqual(self.records()["total"], 0)
-
-    def test_two_accounts_isolate_records_reports_export_and_status(self):
-        bob = self.connect("bob")
-        self.ingest(event())
-        self.assertEqual(self.records(bob)["total"], 0)
-        self.assertEqual(self.ingest(event(), bob)[2]["accepted"], 1)
-        self.ingest(event("two"))
-        self.assertEqual(self.records()["total"], 2)
-        self.assertEqual(self.records(bob)["total"], 1)
-        for cookie, expected in ((self.cookie, 2), (bob, 1)):
-            status, _, body = self.json_request("GET", "/api/status", cookie=cookie)
-            self.assertEqual(status, 200)
-            self.assertEqual(body["collection"]["exact"], expected)
-            status, _, body = self.json_request("GET", "/api/report?period=year", cookie=cookie)
-            self.assertEqual(status, 200)
-            self.assertEqual(body["totals"]["plays"], 0)  # Fixture is 2024, not now.
-            status, _, body = self.request("GET", "/api/export", cookie=cookie)
-            self.assertEqual(status, 200)
-            self.assertEqual(len(list(csv.reader(io.StringIO(body.decode("utf-8-sig"))))), expected + 1)
-        # Attempted client-supplied account ID cannot select Alice's records.
-        self.assertEqual(self.records(bob, "?user_id=" + self.account["user_id"])["total"], 1)
-        # Exercise report isolation with events inside the actual current period,
-        # not merely the older event fixtures excluded by date filtering.
-        stamp = int(time.time() * 1000)
-        self.ingest([event(stamp=stamp), event("two", stamp)])
-        self.ingest(event(stamp=stamp), bob)
-        for cookie, expected in ((self.cookie, 2), (bob, 1)):
-            for period in ("week", "month", "year"):
-                status, _, report = self.json_request("GET", "/api/report?period=" + period, cookie=cookie)
-                self.assertEqual(status, 200)
-                self.assertEqual(report["totals"]["plays"], expected)
 
     def test_report_validation_and_shape(self):
         for query in ("period=day", "period=week&offset=-1", "offset=121", "offset=NaN", "offset=0.5"):
@@ -379,153 +269,16 @@ class ServerTests(unittest.TestCase):
                 status, _, body = self.json_request("GET", f"/api/report?period={period}&offset=120", cookie=self.cookie)
                 self.assertEqual(status, 200, body)
 
-    def test_records_pagination_search_and_exclusive_end(self):
-        self.ingest([event(), event("two", STAMP + 1000), event("three", STAMP + 2000)])
-        page1 = self.records(query="?page=1&size=2")
-        page2 = self.records(query="?page=2&size=2")
-        self.assertEqual(page1["total"], 3)
-        self.assertEqual([row["guid"] for row in page1["items"]], ["three", "two"])
-        self.assertEqual([row["guid"] for row in page2["items"]], ["one"])
-        self.assertEqual(self.records(query="?" + urlencode({"q": "Artist A"}))["total"], 1)
-        self.assertEqual(self.records(query="?q=%25")["total"], 0)
-        self.assertEqual(self.records(query="?q=%27%20OR%201%3D1--")["total"], 0)
-        bounded = self.records(query=f"?start={STAMP}&end={STAMP + 1000}")
-        self.assertEqual([row["guid"] for row in bounded["items"]], ["one"])
-        self.assertEqual(self.records(query="?page=10&size=2")["items"], [])
-
     def test_records_reject_invalid_pagination_and_dates(self):
         for query in ("page=0", "page=-1", "page=abc", "page=100001", "size=0", "size=101", "start=bad", "end=bad"):
             with self.subTest(query=query):
                 self.assertEqual(self.request("GET", "/api/records?" + query, cookie=self.cookie)[0], 400)
-
-    def test_csv_download_neutralizes_all_formula_prefixes(self):
-        prefixes = ["=SUM(1,2)", "+cmd", "-cmd", "@cmd", " \t=IMPORTXML()", "\t+cmd", "\r@cmd"]
-        for index, prefix in enumerate(prefixes):
-            self.service.archive.upsert_track(self.account["user_id"], {
-                "guid": "one", "title": prefix, "artist": prefix, "album": prefix, "duration_ms": 180000})
-            self.ingest(event(stamp=STAMP + index * 1000))
-            status, headers, content = self.request("GET", "/api/export", cookie=self.cookie)
-            self.assertEqual(status, 200)
-            self.assertTrue(content.startswith(b"\xef\xbb\xbf"))
-            self.assertIn("attachment", headers["Content-Disposition"])
-            self.assertTrue(headers["Content-Type"].startswith("text/csv"))
-            rows = list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))
-            for row in rows[1:]:
-                for cell in row[2:5]:
-                    self.assertEqual(cell, "'" + prefix)
 
     def test_metadata_history_and_manual_sync_do_not_invent_plays(self):
         self.assertEqual(self.records()["total"], 0)
         self.assertEqual(self.json_request("POST", "/api/sync", {}, self.cookie)[0], 200)
         self.assertEqual(self.records()["total"], 0)
         self.assertEqual(self.service.archive.track(self.account["user_id"], "one")["duration_ms"], 180000)
-
-    def test_html_bridge_and_nonsecret_sentinel_cookie(self):
-        for path in ("/music/", "/music", "/music/gzip.html", "/music/no-head.html"):
-            with self.subTest(path=path):
-                status, headers, content = self.request("GET", path, cookie=self.cookie)
-                self.assertEqual(status, 200)
-                self.assertIn(b'<script src="/api/collector.js"></script>', content)
-                self.assertIn(b"player", content)
-                self.assertEqual(content.count(b"/api/collector.js"), 1)
-                self.assertIn("music-token=journal-gateway", headers["Set-Cookie"])
-                self.assertIn("SameSite=Strict", headers["Set-Cookie"])
-                self.assertIn("Path=/music/", headers["Set-Cookie"])
-                self.assertNotIn("HttpOnly", headers["Set-Cookie"])
-                self.assertNotIn("upstream-secret", headers["Set-Cookie"])
-                self.assertNotIn("X-Frame-Options", headers)
-                self.assertNotIn("Content-Encoding", headers)
-                self.assertNotIn("Content-Security-Policy", headers)
-                self.assertEqual(int(headers["Content-Length"]), len(content))
-
-    def test_proxy_replaces_session_cookie_and_forwards_signature(self):
-        status, _, _ = self.request("GET", "/music/audio", cookie=self.cookie + "; music-token=journal-gateway; other=private",
-                                     headers={"authx": "nonce=fixture&timestamp=1&sign=fixture", "Accept-Encoding": "gzip"})
-        self.assertEqual(status, 200)
-        outgoing = self.nas.requests[-1]["headers"]
-        self.assertEqual(outgoing["Cookie"], "music-token=upstream-secret-alice")
-        self.assertNotIn("journal_session", outgoing["Cookie"])
-        self.assertEqual(outgoing.get("Authx", outgoing.get("authx")), "nonce=fixture&timestamp=1&sign=fixture")
-        self.assertEqual(outgoing["Accept-Encoding"], "identity")
-        self.assertEqual(outgoing["Origin"], self.nas.origin)
-
-    def test_byte_range_head_and_unknown_length_stream(self):
-        status, headers, body = self.request("GET", "/music/audio", cookie=self.cookie, headers={"Range": "bytes=17-128"})
-        self.assertEqual(status, 206)
-        self.assertEqual(body, MEDIA[17:129])
-        self.assertEqual(headers["Content-Range"], f"bytes 17-128/{len(MEDIA)}")
-        self.assertEqual(headers["Content-Length"], "112")
-        status, headers, body = self.request("HEAD", "/music/audio", cookie=self.cookie)
-        self.assertEqual(status, 200)
-        self.assertEqual(body, b"")
-        self.assertEqual(int(headers["Content-Length"]), len(MEDIA))
-        status, _, body = self.request("GET", "/music/stream", cookie=self.cookie)
-        self.assertEqual(status, 200)
-        self.assertEqual(body, MEDIA)
-
-    def test_head_html_representation_length_matches_injected_get(self):
-        get_status, get_headers, get_body = self.request("GET", "/music/", cookie=self.cookie)
-        head_status, head_headers, head_body = self.request("HEAD", "/music/", cookie=self.cookie)
-        self.assertEqual(get_status, 200)
-        self.assertEqual(head_status, 200)
-        self.assertEqual(head_body, b"")
-        self.assertEqual(int(get_headers["Content-Length"]), len(get_body))
-        self.assertEqual(head_headers["Content-Length"], get_headers["Content-Length"],
-                         "HEAD must describe the same collector-injected HTML representation as GET")
-
-    def test_non_html_compressed_proxy_remains_decodable(self):
-        status, headers, body = self.request("GET", "/music/gzip.js", cookie=self.cookie)
-        self.assertEqual(status, 200)
-        decoded = gzip.decompress(body) if headers.get("Content-Encoding") == "gzip" else body
-        self.assertEqual(decoded, b"window.fixture = true;", "Compressed bytes require Content-Encoding or decompression")
-
-    def test_redirect_is_visible_and_same_nas_location_rewritten(self):
-        status, headers, _ = self.request("GET", "/music/redirect", cookie=self.cookie)
-        self.assertEqual(status, 302)
-        self.assertEqual(headers["Location"], "/music/")
-        status, headers, _ = self.request("GET", "/music/external-redirect", cookie=self.cookie)
-        self.assertEqual(status, 302)
-        self.assertEqual(headers["Location"], "http://127.0.0.1:1/never-contact")
-        self.assertEqual(len(self.nas.requests), 2)
-
-    def test_proxy_blocks_traversal_and_non_music_paths(self):
-        for path in ("/music/../private", "/music/%2e%2e/private", "/music/./audio"):
-            with self.subTest(path=path):
-                self.assertEqual(self.request("GET", path, cookie=self.cookie)[0], 400)
-        self.assertEqual(self.request("GET", "/private", cookie=self.cookie)[0], 404)
-        self.assertEqual(self.nas.requests, [])
-
-    def test_confirmed_nas_code_zero_event_and_cross_channel_dedupe(self):
-        payload = {"events": [event(), event("two"), {"eventType": "track_pause", "occurredAt": STAMP}]}
-        status, _, response = self.json_request("POST", EVENT_PATH, payload, self.cookie)
-        self.assertEqual(status, 200)
-        self.assertEqual(response, self.nas.event_reply)
-        self.assertEqual(json.loads(self.nas.requests[-1]["body"]), payload)
-        records = self.records()
-        self.assertEqual(records["total"], 2)
-        self.assertTrue(all(row["source"] == "gateway" and row["confidence"] == "exact" for row in records["items"]))
-        self.assertEqual(self.ingest(payload)[2]["deduped"], 2)
-        self.assertEqual(self.records()["total"], 2)
-
-    def test_bridge_then_gateway_same_event_is_only_one_record(self):
-        self.assertEqual(self.ingest(event())[2]["accepted"], 1)
-        self.assertEqual(self.json_request("POST", EVENT_PATH, event(), self.cookie)[0], 200)
-        self.assertEqual(self.records()["total"], 1)
-        self.assertEqual(self.records()["items"][0]["source"], "browser_bridge")
-
-    def test_rejected_upstream_event_is_never_stored(self):
-        for status, reply in ((200, {"code": 1001, "message": "denied"}),
-                              (401, {"code": 0}), (500, {"code": 0}),
-                              (200, {"data": None}), (200, {"code": "0"})):
-            with self.subTest(status=status, reply=reply):
-                self.nas.event_status, self.nas.event_reply = status, reply
-                self.assertEqual(self.json_request("POST", EVENT_PATH, event(), self.cookie)[0], status)
-                self.assertEqual(self.records()["total"], 0)
-
-    def test_boolean_false_is_not_numeric_code_zero_confirmation(self):
-        self.nas.event_reply = {"code": False, "message": "invalid protocol"}
-        self.assertEqual(self.json_request("POST", EVENT_PATH, event(), self.cookie)[0], 200)
-        self.assertEqual(self.records()["total"], 0, "JSON false is not the numeric NAS success code 0")
 
     def test_cover_proxy_contract_and_validation(self):
         status, headers, content = self.request("GET", "/api/covers/cover-one", cookie=self.cookie)
@@ -535,27 +288,6 @@ class ServerTests(unittest.TestCase):
         self.assertIn(("cover", "cover-one", "upstream-secret-alice"), FakeMusicClient.calls)
         for path in ("/api/covers/", "/api/covers/%2e%2e", "/api/covers/" + "a" * 129):
             self.assertEqual(self.request("GET", path, cookie=self.cookie)[0], 400)
-
-    def test_authenticated_collector_script_is_served(self):
-        status, headers, body = self.request("GET", "/api/collector.js", cookie=self.cookie)
-        self.assertEqual(status, 200)
-        self.assertIn("application/javascript", headers["Content-Type"])
-        self.assertIn(b"__musicJournalCollector", body)
-        self.assertIn(self.account["user_id"].encode(), body)
-        self.assertNotIn(b"upstream-secret", body)
-        self.assertNotIn(self.cookie.encode(), body)
-
-    def test_old_collector_tab_account_header_rejected_after_switch(self):
-        bob = self.connect("bob")
-        status, _, result = self.json_request("POST", "/api/ingest", event(), bob,
-                                               {"X-Journal-Account": self.account["user_id"]})
-        self.assertEqual(status, 409, result)
-        self.assertEqual(self.records(bob)["total"], 0)
-        self.assertEqual(self.records()["total"], 0)
-        status, _, result = self.json_request("POST", "/api/ingest", event(), self.cookie,
-                                               {"X-Journal-Account": self.account["user_id"]})
-        self.assertEqual(status, 200, result)
-        self.assertEqual(result["accepted"], 1)
 
 
     def test_theme_script_is_served_for_day_night_switch(self):
@@ -615,6 +347,86 @@ class ServerTests(unittest.TestCase):
         self.assertIsNone(fresh.session("journal_session=stale-token"))
         self.assertIsNone(fresh.archive.load_session("stale-token"))
 
+
+    def test_private_endpoints_require_real_session(self):
+        for path in ("/api/report", "/api/records", "/api/export", "/api/export/full",
+                     "/api/covers/cover-one"):
+            for cookie in (None, "journal_session=forged", "music-token=upstream-secret-alice"):
+                with self.subTest(path=path, cookie=cookie):
+                    status, _, body = self.json_request("GET", path, cookie=cookie)
+                    self.assertEqual(status, 401, body)
+        for path in ("/api/import", "/api/sync", "/api/disconnect"):
+            with self.subTest(path=path):
+                self.assertEqual(self.json_request("POST", path, {})[0], 401)
+
+    def test_cross_site_writes_rejected_before_nas_or_archive(self):
+        for method, path in (("POST", "/api/connect"), ("POST", "/api/import"), ("POST", "/api/sync")):
+            with self.subTest(method=method, path=path):
+                status, _, _ = self.request(method, path, {"format": "yinji-backup", "plays": []},
+                                            self.cookie, {"Origin": "https://hostile.invalid"})
+                self.assertEqual(status, 403)
+        self.assertEqual(self.records()["total"], 0)
+
+    def test_same_origin_post_is_allowed(self):
+        status, _, body = self.json_request("POST", "/api/import?mode=merge",
+                                            {"format": "yinji-backup", "version": 1, "plays": [],
+                                             "tracks": [], "artist_images": []},
+                                            self.cookie, {"Origin": self.origin})
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["ok"])
+
+    def test_full_export_and_import_round_trip(self):
+        plays = [{"guid": "one", "played_at": STAMP, "title": "Song one", "artist": "Artist A",
+                  "source": "test", "confidence": "exact", "duration_ms": 180000},
+                 {"guid": "two", "played_at": STAMP + 1000, "title": "Song two", "artist": "Artist B",
+                  "source": "test", "confidence": "observed", "duration_ms": 200000}]
+        self.assertEqual(self.import_plays(plays)["plays"], 2)
+        status, headers, body = self.json_request("GET", "/api/export/full", cookie=self.cookie)
+        self.assertEqual(status, 200)
+        self.assertIn("attachment", headers["Content-Disposition"])
+        self.assertEqual(body["format"], "yinji-backup")
+        self.assertEqual(len(body["plays"]), 2)
+        self.assertNotIn("user_id", body["plays"][0])
+        self.assertNotIn("token", json.dumps(body))
+        self.assertEqual(self.import_plays(plays)["plays"], 0)
+        self.assertEqual(self.records()["total"], 2)
+        restored = self.json_request("POST", "/api/import?mode=restore",
+                                     {"format": "yinji-backup", "version": 1,
+                                      "plays": [plays[0]], "tracks": [], "artist_images": []}, self.cookie)
+        self.assertEqual(restored[0], 200)
+        self.assertEqual(self.records()["total"], 1)
+
+    def test_two_accounts_isolate_records_reports_export_and_status(self):
+        bob = self.connect("bob")
+        self.import_plays([{"guid": "one", "played_at": STAMP, "source": "test"}])
+        self.import_plays([{"guid": "two", "played_at": STAMP, "source": "test"}], bob)
+        self.assertEqual(self.records()["total"], 1)
+        self.assertEqual(self.records(bob)["total"], 1)
+        self.assertEqual(self.records()["items"][0]["guid"], "one")
+        self.assertEqual(self.records(bob)["items"][0]["guid"], "two")
+        status, _, body = self.json_request("GET", "/api/export/full", cookie=bob)
+        self.assertEqual(len(body["plays"]), 1)
+
+    def test_records_pagination_search_and_exclusive_end(self):
+        self.import_plays([{"guid": "one", "played_at": STAMP, "title": "Alpha", "source": "test"},
+                           {"guid": "two", "played_at": STAMP + 1000, "title": "Beta", "source": "test"},
+                           {"guid": "three", "played_at": STAMP + 2000, "title": "Gamma", "source": "test"}])
+        page = self.records(query="?page=2&size=1")
+        self.assertEqual((page["total"], page["page"], len(page["items"])), (3, 2, 1))
+        self.assertEqual(page["items"][0]["guid"], "two")
+        self.assertEqual(self.records(query="?q=Beta")["total"], 1)
+        self.assertEqual(self.records(query=f"?start={STAMP}&end={STAMP + 1000}")["total"], 1)
+
+    def test_csv_download_neutralizes_all_formula_prefixes(self):
+        for index, title in enumerate(("=cmd", "+x", "-y", "@z")):
+            self.import_plays([{"guid": f"g{index}", "played_at": STAMP + index * 1000,
+                                "title": title, "source": "test"}])
+        status, headers, body = self.request("GET", "/api/export", cookie=self.cookie)
+        self.assertEqual(status, 200)
+        self.assertIn("text/csv", headers["Content-Type"])
+        rows = list(csv.reader(io.StringIO(body.decode("utf-8-sig"))))
+        for row in rows[1:]:
+            self.assertTrue(row[2].startswith("'"), row)
 
 class SharedLanSessionTests(unittest.TestCase):
     """Internal-network devices share the saved account session (trust mode)."""

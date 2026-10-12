@@ -117,21 +117,17 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(all(row[2].startswith("'=") for row in formula_rows))
         self.assertTrue(all(row[6] == "test_fixture" for row in rows[1:]))
 
-    def test_fixture_player_html_confirmed_event_and_bridge_deduplication(self):
-        status, headers, body = self.request("GET", "/music/", authenticated=True)
+    def test_fixture_export_and_import_round_trip(self):
+        status, _, body = self.request("GET", "/api/export/full", authenticated=True)
         self.assertEqual(status, 200)
-        self.assertIn(b"TEST FIXTURE NAS", body)
-        self.assertIn(b"/api/collector.js", body)
-        self.assertIn("music-token=journal-gateway", headers["Set-Cookie"])
-        payload = {"events": [{"eventType": "track_play", "occurredAt": int(time.time() * 1000),
-                               "payload": {"trackGUID": TRACKS[0]["guid"]}}]}
-        status, _, body = self.request("POST", "/music/api/v1/event/report", payload, authenticated=True)
+        payload = json.loads(body)
+        self.assertEqual(payload["format"], "yinji-backup")
+        self.assertEqual(len(payload["plays"]), 67)
+        # merging the fixture's own backup into itself changes nothing
+        status, _, body = self.request("POST", "/api/import?mode=merge", payload, authenticated=True)
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["code"], 0)
-        status, _, body = self.request("POST", "/api/ingest", payload, authenticated=True)
-        self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["deduped"], 1)
-        self.assertEqual(self.service.archive.records(self.account_id)["total"], 68)
+        self.assertEqual(json.loads(body)["plays"], 0)
+        self.assertEqual(self.service.archive.records(self.account_id)["total"], 67)
 
     def test_real_connector_rejected_login_is_safe_and_does_not_erase_fixture(self):
         with self.assertRaises(MusicError):

@@ -168,6 +168,13 @@
     const name = isConnected ? status.user?.name || '我的音乐' : '你的音乐，音迹可循';
     text('#header-user', isConnected ? '连接设置' : '连接飞牛账号');
     text('#header-avatar', isConnected ? (name.slice(0, 1).toUpperCase() || '♫') : '♫');
+    const player = $('#open-player');
+    if (isConnected && status?.server) {
+      player.href = status.server + '/music/';
+      player.hidden = false;
+    } else {
+      player.hidden = true;
+    }
     $('#connected-account').hidden = !isConnected;
     $('#change-account').hidden = !isConnected;
     $('#connection-form').hidden = isConnected;
@@ -227,9 +234,9 @@
     else if (isLogin) action.dataset.connect = '';
     else action.dataset.play = '';
     action.textContent = isError ? '重新读取报告' : '追踪我的音乐';
-    text('#report-empty-help', isError ? '不展示旧数据，也不伪造播放记录。' : isLogin ? '连接飞牛音乐，通过本站播放器留下真实播放开始事件。' : '连接只同步音乐信息，不补造历史。请从本站打开飞牛播放器开始采集。');
+    text('#report-empty-help', isError ? '不展示旧数据，也不伪造播放记录。' : isLogin ? '连接飞牛音乐，正常播放即可开始记录。' : '连接只同步音乐信息，不补造历史。连接后正常播放即可开始记录。');
     const title = isLogin ? '你的音乐，值得被记住' : isError ? '这份报告暂时读不到' : '音乐的下一页，等待你来写';
-    const description = isLogin ? '连接飞牛账号后，在本站打开播放器开始记录。你的私人记录仅登录后可见。' : isError ? message || '无法获取报告，请检查服务连接后重新读取。' : '本期没有采集到播放。通过本站打开飞牛播放器，让下一次播放成为第一条音迹。';
+    const description = isLogin ? '连接飞牛账号后正常播放即可自动记录。你的私人记录仅登录后可见。' : isError ? message || '无法获取报告，请检查服务连接后重新读取。' : '本期没有采集到播放。正常播放音乐，下一次播放就会成为第一条音迹。';
     state.report = null;
     $('#report-content').classList.remove('is-loading');
     $('#report-content').setAttribute('aria-busy', 'false');
@@ -308,7 +315,7 @@
     if (plays === 0) {
       text('#report-empty-title', '您没有收听任何音乐');
       text('#report-empty-description', '您好像还没有进行音乐记录，因此没有收听报告。下次不要错过，马上开始音乐记录！');
-      text('#report-empty-help', '没有真实播放开始事件时，报告保持空白。通过本站播放器采集，不补造无日期的旧历史。');
+      text('#report-empty-help', '没有真实播放开始事件时，报告保持空白。播放由轮询探测记录，不补造无日期的旧历史。');
       $('#report-empty-action').textContent = '追踪我的音乐';
       delete $('#report-empty-action').dataset.connect;
       delete $('#report-empty-action').dataset.retry;
@@ -334,7 +341,7 @@
     ['artists', 'albums', 'tracks'].forEach(key => text(`#metric-${key}`, number(total[key])));
     $('#metric-days').innerHTML = `${number(total.active_days)}<span class="metric-unit">天</span>`;
     text('#summary-title', plays ? `在${rangeLabel(report)}，音乐为你留下了 ${number(plays)} 次回响。` : '这一期还很安静，下一首歌会留下痕迹。');
-    text('#summary-description', plays ? `你与 ${number(total.artists)} 位歌手、${number(total.tracks)} 首曲目相遇。曲目时长合计约 ${longDuration(total.estimated_duration_ms)}，不代表实际收听或听完时长。` : '这不是示例报告：本期确实尚未采集到播放。首次同步仅有曲库元数据；请从本站打开飞牛播放器，留下真正的播放事件。');
+    text('#summary-description', plays ? `你与 ${number(total.artists)} 位歌手、${number(total.tracks)} 首曲目相遇。曲目时长合计约 ${longDuration(total.estimated_duration_ms)}，不代表实际收听或听完时长。` : '这不是示例报告：本期确实尚未采集到播放。首次同步仅有曲库元数据；正常播放音乐即可留下真正的播放事件。');
     const change = report.change_percent;
     if (change !== null && change !== undefined && Number.isFinite(Number(change))) {
       const value = Number(change);
@@ -390,7 +397,7 @@
   function renderTimeline(items, report) {
     const series = items.filter(item => item && typeof item === 'object');
     if (!series.length || !series.some(item => count(item.plays) || count(item.previous))) {
-      $('#timeline-chart').innerHTML = emptyState('这一期，等待第一段旋律', '还没有采集到本期或上一期播放。从本站打开飞牛播放器，留下你的音乐足迹。');
+      $('#timeline-chart').innerHTML = emptyState('这一期，等待第一段旋律', '还没有采集到本期或上一期播放。正常播放音乐，留下你的音乐足迹。');
       return;
     }
     const width = 1000, height = 230, left = 38, right = 10, top = 15, bottom = 32;
@@ -766,7 +773,11 @@
   document.addEventListener('click', event => {
     if (event.target.closest('[data-connect]')) openSettings();
     if (event.target.closest('[data-retry]')) refreshAll();
-    if (event.target.closest('[data-play]')) window.open('/music/', '_blank', 'noopener');
+    if (event.target.closest('[data-play]')) {
+      const server = state.status?.server;
+      if (server) window.open(server + '/music/', '_blank', 'noopener');
+      else openSettings();
+    }
   });
   $('#connection-form').addEventListener('submit', async event => {
     event.preventDefault();
@@ -794,7 +805,7 @@
       await loadStatus();
       if (!connected()) throw new ApiError('登录成功但会话未建立，请确认浏览器允许本站 Cookie 后重试。');
       success = true;
-      showToast('连接成功。请从本站打开飞牛播放器，留下真实播放记录。');
+      showToast('连接成功。正常使用飞牛音乐，播放会自动被记录。');
     } catch (error) {
       text('#connection-error', error.message);
       $('#connection-error').hidden = false;

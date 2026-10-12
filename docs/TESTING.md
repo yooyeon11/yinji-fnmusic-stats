@@ -8,10 +8,9 @@
 
 ```sh
 python -m unittest discover -s tests -v
-node tests/test_collector.js
 ```
 
-Python 仅需标准库（Python 3.10+）；Node 只用于浏览器采集脚本的测试，不是应用运行依赖。
+全部测试仅需标准库（Python 3.10+）。
 
 ## 覆盖范围
 
@@ -21,9 +20,8 @@ Python 仅需标准库（Python 3.10+）；Node 只用于浏览器采集脚本�
 | `test_report_extras.py` | 星期分布、流派、年代（仅真实发行年）、比例、指纹、快速事实、发现排名、流派流的时间轴与未来污染防护 |
 | `test_connector.py` | 公开前端签名（GET/POST）、登录摘要、历史分页、元数据、封面路由与响应、错误净化 |
 | `test_poller.py` | 播放探测：历史序列 diff、连续重播、首次只建基线不回填、15 分钟窗口与精确记录对账、对账失败时的兜底（首次出现曲目照记、单条目前移记为重播、多种变动形状不猜测）、账号隔离、`recent()` 真实 HTTP、报告精确/估算拆分 |
-| `test_server.py` | 真实 HTTP：会话、401/403、跨站写拒绝、超大请求体、事件捕获、代理注入、HEAD 长度、Range、压缩、gzip 注入、账号切换 409 |
-| `test_flow.py` | 连接器 → 假 NAS → HTTP 服务 → 临时归档全链路；封面契约；报表分页；CSV；桥接去重 |
-| `test_collector.js` | 浏览器桥接：fetch/XHR 拦截、成功确认、离线队列、批量、账号作用域、损坏存储容错 |
+| `test_server.py` | 真实 HTTP：会话、401/403、跨站写拒绝、超大请求体、完整导出与导入（合并/恢复）、账号数据隔离、分页与 CSV 公式注入防护 |
+| `test_flow.py` | 连接器 → 假 NAS → HTTP 服务 → 临时归档全链路；封面契约；报表分页；CSV；完整导出与合并导入 |
 
 ## 浏览器验收（模拟数据）
 

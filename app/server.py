@@ -1,6 +1,5 @@
 """A dependency-free, authenticated web app and FN Music recording gateway."""
 import argparse
-import gzip
 import hashlib
 import ipaddress
 import json
@@ -9,9 +8,7 @@ import os
 import secrets
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,9 +17,8 @@ from .storage import Archive
 
 ROOT = Path(__file__).resolve().parent.parent
 log = logging.getLogger("journal")
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 MAX_BODY = 2 * 1024 * 1024
-HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"}
 LOGOUT_COOKIE = "journal_logout"
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -193,31 +189,6 @@ class Service:
         finally:
             self.sync_lock.release()
 
-    def enrich(self, account, body):
-        from .connector import MusicClient, parse_artists, parse_track
-        events = body if isinstance(body, list) else body.get("events", [body] if "eventType" in body else []) if isinstance(body, dict) else []
-        if not isinstance(events, list):
-            return
-        for event in events[:1000]:
-            if not isinstance(event, dict) or event.get("eventType") != "track_play":
-                continue
-            guid = (event.get("payload") or {}).get("trackGUID")
-            if not guid or self.archive.track(account["user_id"], guid):
-                continue
-            try:
-                metadata = MusicClient(account["server"], account["token"]).track(guid)
-                self.archive.upsert_track(account["user_id"], parse_track(metadata))
-                for artist in parse_artists(metadata):
-                    self.archive.upsert_artist(account["user_id"], artist["name"], artist["cover_id"])
-            except Exception:
-                log.warning("Track metadata unavailable")
-
-    def capture(self, account, body, source):
-        result = self.archive.ingest(account["user_id"], body, source)
-        if result["accepted"]:
-            threading.Thread(target=self.enrich, args=(account, body), daemon=True).start()
-        return result
-
     def detect_plays(self, account):
         from .connector import MusicClient
         from .poller import detect
@@ -384,8 +355,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, {"connected": True, "needs_login": False, "user": {"name": account["user"].get("name") or account["user"].get("username")},
                                   "server": account["server"], "last_sync": self.service.archive.get_state(user_id, "last_sync"),
                                   "error": self.service.archive.get_state(user_id, "error"), "collection": self.service.archive.status(user_id),
-                                  "notice": "代理与浏览器采集带精确时间；手机与原页面播放由轮询探测补记，时间按首次发现估算；无真实时间的旧历史不会回填。"})
-        if path.startswith("/api/") or path.startswith("/music"):
+                                  "notice": "播放由轮询探测记录：定时读取飞牛播放历史，时间按首次发现估算；无真实时间的旧历史不会回填。"})
+        if path.startswith("/api/"):
             account = self.authorized()
             if not account:
                 return
@@ -417,11 +388,6 @@ class Handler(BaseHTTPRequestHandler):
                 if not ctype.startswith("image/"):
                     return self.failure(502, "无效封面响应")
                 return self.send(200, body, ctype)
-            if path == "/api/collector.js":
-                script = "window.__journalAccount=" + json.dumps(account["user_id"]) + ";\n"
-                return self.send(200, script.encode() + (ROOT / "web" / "collector.js").read_bytes(), "application/javascript; charset=utf-8")
-            if path == "/music" or path.startswith("/music/"):
-                return self.proxy(account)
             return self.failure(404, "接口不存在")
         allowed = {"/": "index.html", "/app.css": "app.css", "/app.js": "app.js", "/theme.js": "theme.js", "/favicon.svg": "assets/icon.svg"}
         file = allowed.get(path)
@@ -436,9 +402,6 @@ class Handler(BaseHTTPRequestHandler):
             if not self.same_origin():
                 return self.reject_cross_site()
             path = urllib.parse.urlsplit(self.path).path
-            if path.startswith("/music/"):
-                account = self.authorized()
-                return self.proxy(account) if account else None
             raw = self.read_body(64 * 1024 * 1024) if path == "/api/import" else self.read_body()
             if "application/json" not in self.headers.get("Content-Type", ""):
                 return self.failure(415, "请使用 JSON 请求")
@@ -483,11 +446,6 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/sync":
                 self.service.sync(account)
                 return self.send(200, {"ok": True, "error": self.service.archive.get_state(account["user_id"], "error")})
-            if path == "/api/ingest":
-                owner = self.headers.get("X-Journal-Account")
-                if owner and owner != account["user_id"]:
-                    return self.failure(409, "账号已切换，请回到对应账号后同步待发记录")
-                return self.send(200, self.service.capture(account, body, "browser_bridge"))
             if path == "/api/import":
                 mode = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("mode", ["merge"])[-1]
                 counts = self.service.archive.restore_all(account["user_id"], body, mode)
@@ -502,109 +460,16 @@ class Handler(BaseHTTPRequestHandler):
             self.failure(502, "无法完成请求，请检查飞牛服务连接")
 
     def do_PUT(self):
-        self.handle_proxy_method()
+        self.failure(405, "不支持的方法")
 
     def do_DELETE(self):
-        self.handle_proxy_method()
+        self.failure(405, "不支持的方法")
 
     def do_PATCH(self):
-        self.handle_proxy_method()
+        self.failure(405, "不支持的方法")
 
     def do_OPTIONS(self):
-        self.send(204, b"", headers={"Allow": "GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS"})
-
-    def handle_proxy_method(self):
-        if not self.same_origin():
-            return self.reject_cross_site()
-        account = self.authorized()
-        if account and self.path.startswith("/music/"):
-            try:
-                self.proxy(account)
-            except (ValueError, OSError):
-                self.failure(502, "飞牛请求失败")
-        elif account:
-            self.failure(405, "不支持的方法")
-
-    def proxy(self, account):
-        path = urllib.parse.urlsplit(self.path).path
-        if path != "/music" and not path.startswith("/music/"):
-            return self.failure(403, "不允许代理此路径")
-        from .connector import _validate_path
-        try:
-            _validate_path(self.path)
-        except ValueError:
-            return self.failure(400, "无效路径")
-        body = self.read_body() if self.command not in ("GET", "HEAD") else None
-        url = account["server"] + self.path
-        headers = {key: value for key, value in self.headers.items() if key.lower() not in HOP_HEADERS | {"host", "cookie", "content-length", "accept-encoding", "origin", "referer"}}
-        headers["Cookie"] = "music-token=" + account["token"]
-        headers["Accept-Encoding"] = "identity"
-        headers["Origin"] = account["server"]
-        headers["Referer"] = account["server"] + "/music/"
-        upstream_method = "GET" if self.command == "HEAD" else self.command
-        request = urllib.request.Request(url, data=body, headers=headers, method=upstream_method)
-        # Redirects stay visible so an upstream redirect cannot silently proxy another host.
-        class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, hdrs, newurl):
-                return None
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
-        try:
-            response = opener.open(request, timeout=25)
-        except urllib.error.HTTPError as exc:
-            response = exc
-        with response:
-            status = response.status
-            ctype = response.headers.get("Content-Type", "application/octet-stream")
-            response_headers = {key: value for key, value in response.headers.items() if key.lower() not in HOP_HEADERS | {"content-length", "set-cookie", "content-security-policy", "content-security-policy-report-only", "x-frame-options"}}
-            if "Location" in response_headers:
-                location = response_headers["Location"]
-                if location.startswith(account["server"] + "/music"):
-                    response_headers["Location"] = location[len(account["server"]):]
-            if "text/html" in ctype:
-                response_headers.pop("Content-Encoding", None)
-                content = response.read(MAX_BODY + 1)
-                if len(content) > MAX_BODY:
-                    return self.failure(502, "飞牛页面过大")
-                if response.headers.get("Content-Encoding") == "gzip":
-                    content = gzip.decompress(content)
-                text = content.decode("utf-8")
-                bridge = '<script src="/api/collector.js"></script>'
-                if "<head>" in text:
-                    text = text.replace("<head>", "<head>" + bridge, 1)
-                else:
-                    text = bridge + text
-                response_headers["Set-Cookie"] = "music-token=journal-gateway; SameSite=Strict; Path=/music/"
-                return self.send(status, text, ctype, response_headers)
-            if path.endswith("/event/report") and body and 200 <= status < 300:
-                content = response.read(MAX_BODY + 1)
-                try:
-                    reply = json.loads(content)
-                    if isinstance(reply, dict) and type(reply.get("code")) is int and reply["code"] == 0:
-                        self.service.capture(account, json.loads(body), "gateway")
-                except (ValueError, TypeError):
-                    log.warning("Unrecognized upstream event response")
-                return self.send(status, content, ctype, response_headers)
-            self.send_response(status)
-            for key, value in response_headers.items():
-                self.send_header(key, value)
-            length = response.headers.get("Content-Length")
-            if length is not None:
-                self.send_header("Content-Length", length)
-            else:
-                self.send_header("Connection", "close")
-                self.close_connection = True
-            self.end_headers()
-            if self.command != "HEAD":
-                try:
-                    while True:
-                        block = response.read(64 * 1024)
-                        if not block:
-                            break
-                        self.wfile.write(block)
-                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                    # Playback or download was cancelled; the client is gone.
-                    pass
-
+        self.send(204, b"", headers={"Allow": "GET, HEAD, POST, OPTIONS"})
 
 def main():
     parser = argparse.ArgumentParser(description="音迹 · 飞牛音乐记录")
